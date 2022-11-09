@@ -482,8 +482,7 @@ static void walt_sched_account_irqstart(int cpu, struct task_struct *curr)
 	raw_spin_unlock(&rq->lock);
 }
 
-static void walt_update_task_ravg(struct task_struct *p, struct rq *rq, int event,
-						u64 wallclock, u64 irqtime);
+static void walt_update_task_ravg(struct task_struct *p, struct rq *rq, int event, u64 wallclock, u64 irqtime);
 static void walt_sched_account_irqend(int cpu, struct task_struct *curr, u64 delta)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -988,14 +987,10 @@ static void fixup_busy_time(struct task_struct *p, int new_cpu)
 		WALT_BUG(p, "on CPU %d task %s(%d) not on src_rq %d",
 				raw_smp_processor_id(), p->comm, p->pid, src_rq->cpu);
 
-	walt_update_task_ravg(task_rq(p)->curr, task_rq(p),
-			 TASK_UPDATE,
-			 wallclock, 0);
-	walt_update_task_ravg(dest_rq->curr, dest_rq,
-			 TASK_UPDATE, wallclock, 0);
+	walt_update_task_ravg(task_rq(p)->curr, task_rq(p), TASK_UPDATE, wallclock, 0);
+	walt_update_task_ravg(dest_rq->curr, dest_rq, TASK_UPDATE, wallclock, 0);
 
-	walt_update_task_ravg(p, task_rq(p), TASK_MIGRATE,
-			 wallclock, 0);
+	walt_update_task_ravg(p, task_rq(p), TASK_MIGRATE, wallclock, 0);
 
 	update_task_cpu_cycles(p, new_cpu, wallclock);
 
@@ -1458,25 +1453,36 @@ static inline int cpu_is_waiting_on_io(struct rq *rq)
 {
 	if (!sched_io_is_busy)
 		return 0;
-
+	//判断这次cpu进入idle是否因为iowait。如果是的话出于性能考虑，需要将这段idle时间纳入cpu load。
 	return atomic_read(&rq->nr_iowait);
 }
-
+/*检查这个task p产生的load或irqtime是否会对cpu load产生影响*/
 static int account_busy_for_cpu_time(struct rq *rq, struct task_struct *p,
 				     u64 irqtime, int event)
 {
-	if (is_idle_task(p)) {
+	if (is_idle_task(p)) {//idle task是个特殊情况，单独拎出来判断。
 		/* TASK_WAKE && TASK_MIGRATE is not possible on idle task! */
+		/* PICK_NEXT_TASK是相对idle task而言的，即idle task马上运行，有机会调用到这里。
+		 * 但距离上次更新idle task都没有运行，期间不会产生load，无需更新。
+		 */
 		if (event == PICK_NEXT_TASK)
 			return 0;
 
 		/* PUT_PREV_TASK, TASK_UPDATE && IRQ_UPDATE are left */
+		/*
+		 * irqtime是cpu idle期间处理中断的时间，此时cpu非空闲，需要纳入到cpu load的统计里。
+		 * 如果要将cpu因iowait而进入idle的时间纳入cpu load，需要调用cpu_is_waiting_on_io()进行判断
+		 */
 		return irqtime || cpu_is_waiting_on_io(rq);
 	}
-
-	if (event == TASK_WAKE)
+	//以下为非idle task，分别判断每个event下是否需要更新cpu load：
+	if (event == TASK_WAKE)//task此时被唤醒，说明自上次更新以来一直没有运行，因此不会对cpu load造成影响，不必统计。
 		return 0;
 
+	/*
+	 * IRQ_UPDATE只在task p为idle task时才有机会被调到，而对idle task的处理已经在前面完成了处理。实验验证也不会出现这种情况，多余了？
+	 * PUT_PREV_TASK代表task自上次更新以来一直在运行，会对cpu load产生影响，故需要更新。
+	 */
 	if (event == PUT_PREV_TASK || event == IRQ_UPDATE)
 		return 1;
 
@@ -1485,13 +1491,21 @@ static int account_busy_for_cpu_time(struct rq *rq, struct task_struct *p,
 	 * related groups
 	 */
 	if (event == TASK_UPDATE) {
-		if (rq->curr == p)
+		if (rq->curr == p)//curr task在TASK_UPDATE时load会发生变化，会对cpu load产生影响，故需要统计。
 			return 1;
-
+		/*
+		 * TASK_UPDATE主要作用于curr task，但是在transfer_busy_time里会对要迁移到另外一个group的p对所在rq load产生的影响进行统计。
+		 * 因为WALT里对group load的特殊统计和使用，这个操作是必要的。怎样操作呢？我理解得从原来的group里删掉该task的痕迹。
+		 * 如果该task之前sleep，那不会产生load，也就不用更新了，直接刨掉原来的痕迹就OK了。
+		 * 如果该task在rq上等待运行，那就得看SCHED_FREQ_ACCOUNT_WAIT_TIME是否被enable了。
+		 */
 		return p->on_rq ? SCHED_FREQ_ACCOUNT_WAIT_TIME : 0;
 	}
 
 	/* TASK_MIGRATE, PICK_NEXT_TASK left */
+	/*
+	 * 这两个event前task在cpu rq上等待运行，所以就要根据是否使能了SCHED_FREQ_ACCOUNT_WAIT_TIME来判断是否更新cpu load。
+	 */
 	return SCHED_FREQ_ACCOUNT_WAIT_TIME;
 }
 
@@ -1533,18 +1547,21 @@ static bool do_pl_notif(struct rq *rq)
 static void rollover_cpu_window(struct rq *rq, bool full_window)
 {
 	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
+	//再次强调下面wrq里这四个成员目前存储的还是上次更新时curr和prev window的load！！！
 	u64 curr_sum = wrq->curr_runnable_sum;
 	u64 nt_curr_sum = wrq->nt_curr_runnable_sum;
 	u64 grp_curr_sum = wrq->grp_time.curr_runnable_sum;
 	u64 grp_nt_curr_sum = wrq->grp_time.nt_curr_runnable_sum;
 
 	if (unlikely(full_window)) {
+		//如果跨过了完整的窗口，那prev窗口已经变成了最近的一个完整窗口，这里为什么要将这些值设为0呢？
 		curr_sum = 0;
 		nt_curr_sum = 0;
 		grp_curr_sum = 0;
 		grp_nt_curr_sum = 0;
 	}
 
+	//这里用原来的curr初始化prev，curr直接初始化为0。我理解后续会对prev和curr都进行更新。
 	wrq->prev_runnable_sum = curr_sum;
 	wrq->nt_prev_runnable_sum = nt_curr_sum;
 	wrq->grp_time.prev_runnable_sum = grp_curr_sum;
@@ -1566,11 +1583,12 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 	int new_window, full_window = 0;
 	int p_is_curr_task = (p == rq->curr);
 	struct walt_task_struct *wts = (struct walt_task_struct *) p->android_vendor_data1;
-	u64 mark_start = wts->mark_start;
+	u64 mark_start = wts->mark_start;//此时的wts->mark_start还是上次更新时的时间
 	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
-	u64 window_start = wrq->window_start;
+	u64 window_start = wrq->window_start;//此时的wrq->window_start已经更新为最新的curr window的开始时间。
 	u32 window_size = wrq->prev_window_size;
 	u64 delta;
+	//注意此时的curr_runnable_sum和prev_runnable_sum存储的还是上次更新时的curr和prev窗口的load，这对理解rollover_*函数非常重要。
 	u64 *curr_runnable_sum = &wrq->curr_runnable_sum;
 	u64 *prev_runnable_sum = &wrq->prev_runnable_sum;
 	u64 *nt_curr_runnable_sum = &wrq->nt_curr_runnable_sum;
@@ -1580,13 +1598,12 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 	int cpu = rq->cpu;
 	u32 old_curr_window = wts->curr_window;
 
-	new_window = mark_start < window_start;
+	new_window = mark_start < window_start;//判断本次更新是否跨了窗口，即case2&3
 	if (new_window)
-		full_window = (window_start - mark_start) >= window_size;
+		full_window = (window_start - mark_start) >= window_size;//进一步判断本次更新是否跨了完整的窗口，即case3
 
 	/*
-	 * Handle per-task window rollover. We don't care about the
-	 * idle task.
+	 * Handle per-task window rollover. We don't care about the idle task.
 	 */
 	if (!is_idle_task(p)) {
 		if (new_window)
@@ -1595,7 +1612,7 @@ static void update_cpu_busy_time(struct task_struct *p, struct rq *rq,
 
 	new_task = is_new_task(p);
 
-	if (p_is_curr_task && new_window) {
+	if (p_is_curr_task && new_window) {//一个特殊情况，自上次更新，curr task一直运行并跨过了窗口
 		rollover_cpu_window(rq, full_window);
 		rollover_top_tasks(rq, full_window);
 	}
@@ -2162,8 +2179,7 @@ static inline void run_walt_irq_work(u64 old_window_start, struct rq *rq)
 }
 
 /* Reflect task activity on its demand and cpu's busy time statistics */
-static void walt_update_task_ravg(struct task_struct *p, struct rq *rq, int event,
-						u64 wallclock, u64 irqtime)
+static void walt_update_task_ravg(struct task_struct *p, struct rq *rq, int event, u64 wallclock, u64 irqtime)
 {
 	u64 old_window_start;
 	struct walt_rq *wrq = (struct walt_rq *) rq->android_vendor_data1;
@@ -2673,8 +2689,7 @@ static int cpufreq_notifier_trans(struct notifier_block *nb,
 			struct rq *rq = cpu_rq(j);
 
 			raw_spin_lock_irqsave(&rq->lock, flags);
-			walt_update_task_ravg(rq->curr, rq, TASK_UPDATE,
-					 walt_ktime_get_ns(), 0);
+			walt_update_task_ravg(rq->curr, rq, TASK_UPDATE, walt_ktime_get_ns(), 0);
 			raw_spin_unlock_irqrestore(&rq->lock, flags);
 		}
 
@@ -3414,11 +3429,9 @@ static void walt_irq_work(struct irq_work *irq_work)
 			rq = cpu_rq(cpu);
 			wrq = (struct walt_rq *) rq->android_vendor_data1;
 			if (rq->curr) {
-				walt_update_task_ravg(rq->curr, rq,
-						TASK_UPDATE, wc, 0);
+				walt_update_task_ravg(rq->curr, rq, TASK_UPDATE, wc, 0);
 				account_load_subtractions(rq);
-				aggr_grp_load +=
-					wrq->grp_time.prev_runnable_sum;
+				aggr_grp_load += wrq->grp_time.prev_runnable_sum;
 			}
 			if (is_migration && wrq->notif_pending &&
 			    cpumask_test_cpu(cpu, &asym_cap_sibling_cpus)) {
@@ -4059,8 +4072,7 @@ static void android_rvh_schedule(void *unused, struct task_struct *prev,
 		walt_update_task_ravg(prev, rq, PUT_PREV_TASK, wallclock, 0);
 		walt_update_task_ravg(next, rq, PICK_NEXT_TASK, wallclock, 0);
 		if (is_idle_task(next) && wrq->walt_stats.cumulative_runnable_avg_scaled != 0)
-			WALT_BUG(next, "next=idle cra non zero=%d\n",
-				 wrq->walt_stats.cumulative_runnable_avg_scaled);
+			WALT_BUG(next, "next=idle cra non zero=%d\n", wrq->walt_stats.cumulative_runnable_avg_scaled);
 	} else {
 		walt_update_task_ravg(prev, rq, TASK_UPDATE, wallclock, 0);
 	}
