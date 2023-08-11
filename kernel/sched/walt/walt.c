@@ -4290,7 +4290,7 @@ static void walt_init_tg_pointers(void)
 static void walt_init(struct work_struct *work)
 {
 	struct ctl_table_header *hdr;
-	static atomic_t already_inited = ATOMIC_INIT(0);
+	static atomic_t already_inited = ATOMIC_INIT(0);//该函数存在两个调用点，避免重复执行
 	int i;
 
 	might_sleep();
@@ -4298,7 +4298,7 @@ static void walt_init(struct work_struct *work)
 	if (atomic_cmpxchg(&already_inited, 0, 1))
 		return;
 
-	walt_tunables();
+	walt_tunables();//walt相关参数的初始化操作。
 
 	register_syscore_ops(&walt_syscore_ops);
 	BUG_ON(alloc_related_thread_groups());
@@ -4329,7 +4329,7 @@ static void walt_init(struct work_struct *work)
 		sysctl_sched_features &= ~(1UL << i);
 	}
 }
-
+//注册vendor hook到函数update_topology_flags_workfn()里，尝试在完成sched_domains的build后执行walt的init操作。
 static DECLARE_WORK(walt_init_work, walt_init);
 static void android_vh_update_topology_flags_workfn(void *unused, void *unused2)
 {
