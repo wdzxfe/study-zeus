@@ -4335,7 +4335,7 @@ static void android_vh_update_topology_flags_workfn(void *unused, void *unused2)
 {
 	schedule_work(&walt_init_work);
 }
-
+//用于检查自己定义的结构体是否超出了vendor data的size，很有意义！
 #define WALT_VENDOR_DATA_SIZE_TEST(wstruct, kstruct)		\
 	BUILD_BUG_ON(sizeof(wstruct) > (sizeof(u64) *		\
 		ARRAY_SIZE(((kstruct *)0)->android_vendor_data1)))
