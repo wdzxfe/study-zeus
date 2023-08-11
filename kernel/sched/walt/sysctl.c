@@ -911,13 +911,13 @@ struct ctl_table walt_base_table[] = {
 	{ },
 };
 
-void walt_tunables(void)
+void walt_tunables(void)//在walt_init()里被调用，用于初始化相关参数。
 {
 	int i;
 
-	for (i = 0; i < MAX_MARGIN_LEVELS; i++) {
-		sysctl_sched_capacity_margin_up_pct[i] = 95; /* ~5% margin */
-		sysctl_sched_capacity_margin_dn_pct[i] = 85; /* ~15% margin */
+	for (i = 0; i < MAX_MARGIN_LEVELS; i++) { //#define MAX_MARGIN_LEVELS (MAX_CLUSTERS - 1)，如果是3个cluster的话，就分别表示小核和中核的margin
+		sysctl_sched_capacity_margin_up_pct[i] = 95; /* ~5% margin，用于在函数task_fits_capacity()里检查task p正在或之前运行的cpu的capacity能否满足task p的需求，以这里的默认值为例，task load小于cap的95%，说明原来的cpu还能满足该task的需求，否则需要找性能更强的core，值越小则task越容易上大核。*/
+		sysctl_sched_capacity_margin_dn_pct[i] = 85; /* ~15% margin，用于在函数task_fits_capacity()里检查task p是否能迁移到性能弱的core上，只有当性能弱的core的cap*85%能满足task的需求，就可以向下迁移。该值越大，越容易向下迁task，为了避免ping-pang，该值要设置的小一些。*/
 	}
 
 	sysctl_sched_group_upmigrate_pct = 100;
