@@ -4335,7 +4335,7 @@ static void android_vh_update_topology_flags_workfn(void *unused, void *unused2)
 {
 	schedule_work(&walt_init_work);
 }
-//用于检查自己定义的结构体是否超出了vendor data的size，很有意义！
+//用于检查自己定义的结构体是否超出了vendor data的size。BUILD_BUG_ON, 看起来是在build阶段就进行了检查，很有意义！
 #define WALT_VENDOR_DATA_SIZE_TEST(wstruct, kstruct)		\
 	BUILD_BUG_ON(sizeof(wstruct) > (sizeof(u64) *		\
 		ARRAY_SIZE(((kstruct *)0)->android_vendor_data1)))
@@ -4350,6 +4350,11 @@ static int walt_module_init(void)
 	register_trace_android_vh_update_topology_flags_workfn(
 			android_vh_update_topology_flags_workfn, NULL);
 
+	/* topology_update_done是定义在arch_topology.c里的一个全局变量，在函数update_topology_flags_workfn()里会被置为true。
+ 	 * 一般来说，module执行会较晚，所以上面注册到update_topology_flags_workfn()里的vendor hook大概率是执行不到的。
+   	 * 所以这里需要判断一下topology_update_done，false的话说明vendor hook还有机会执行，下面的代码就不需要执行了。否则可能(大概率)vendor hook没能执行，就得在这里执行一下了。
+     	 * 为了避免重复，在work func，即walt_init()里通过原子变量already_inited来达到此目的。
+	 */
 	if (topology_update_done)
 		schedule_work(&walt_init_work);
 
